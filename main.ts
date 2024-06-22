@@ -6,64 +6,113 @@ import {
   dirname,
 } from "https://deno.land/std@0.95.0/path/mod.ts";
 
+interface Task {
+  id: number;
+  type: string;
+  filePath?: string;
+  data?: Uint8Array;
+  targetPath?: string;
+  cipher?: string;
+  password?: string;
+}
+
+class WorkerPool {
+  workers: Worker[];
+  queue: Task[];
+  busyWorkers: Set<Worker>;
+  taskResolvers: Map<number, (value: any) => void>;
+  currentTaskId: number;
+
+  constructor(scriptPath: string, size: number) {
+    this.workers = [];
+    this.queue = [];
+    this.busyWorkers = new Set();
+    this.taskResolvers = new Map();
+    this.currentTaskId = 0;
+
+    for (let i = 0; i < size; i++) {
+      const worker = new Worker(new URL(scriptPath, import.meta.url).href, {
+        type: "module",
+      });
+      worker.onmessage = this.handleMessage.bind(this);
+      this.workers.push(worker);
+    }
+  }
+
+  handleMessage(e: MessageEvent) {
+    const { id, result } = e.data;
+    const worker = e.target as Worker;
+    this.busyWorkers.delete(worker);
+
+    if (this.taskResolvers.has(id)) {
+      this.taskResolvers.get(id)(result);
+      this.taskResolvers.delete(id);
+    }
+
+    if (this.queue.length > 0) {
+      const task = this.queue.shift();
+      this.assignTask(worker, task);
+    }
+  }
+
+  assignTask(worker: Worker, task: Task) {
+    this.busyWorkers.add(worker);
+    worker.postMessage(task);
+  }
+
+  addTask(task: Task) {
+    return new Promise((resolve) => {
+      task.id = this.currentTaskId++;
+      this.taskResolvers.set(task.id, resolve);
+
+      const idleWorker = this.workers.find(
+        (worker) => !this.busyWorkers.has(worker),
+      );
+
+      if (idleWorker) {
+        this.assignTask(idleWorker, task);
+      } else {
+        this.queue.push(task);
+      }
+    });
+  }
+
+  terminate() {
+    this.workers.forEach((worker) => worker.terminate());
+  }
+}
+
 async function processFile(
+  fileWorkerPool: WorkerPool,
+  cryptoWorkerPool: WorkerPool,
   filePath: string,
   targetFilePath: string,
   action: string,
   cipher: string,
   password: string,
 ) {
-  const fileWorker = new Worker(
-    new URL("./file_worker.ts", import.meta.url).href,
-    { type: "module" },
-  );
-  const cryptoWorker = new Worker(
-    new URL("./crypto_worker.ts", import.meta.url).href,
-    { type: "module" },
-  );
-
-  fileWorker.postMessage({ type: "read", filePath });
-
-  const fileContent: Uint8Array = await new Promise((resolve) => {
-    fileWorker.onmessage = (e) => {
-      resolve(e.data);
-    };
+  const fileContent: Uint8Array = await fileWorkerPool.addTask({
+    type: "read",
+    filePath,
   });
-
-  cryptoWorker.postMessage({
+  const result: Uint8Array = await cryptoWorkerPool.addTask({
     type: action,
     data: fileContent,
     cipher,
     password,
   });
-
-  const result: Uint8Array = await new Promise((resolve) => {
-    cryptoWorker.onmessage = (e) => {
-      resolve(e.data);
-    };
-  });
-
   await ensureDir(dirname(targetFilePath));
-
-  fileWorker.postMessage({
+  await fileWorkerPool.addTask({
     type: "write",
     filePath: targetFilePath,
     data: result,
   });
-
-  await new Promise((resolve) => {
-    fileWorker.onmessage = (e) => {
-      resolve(e.data);
-    };
-  });
-
-  fileWorker.terminate();
-  cryptoWorker.terminate();
-
   console.log(`File ${action}ed successfully. Saved to ${targetFilePath}`);
 }
 
 async function processDirectory(
+  fileWorkerPool: WorkerPool,
+  cryptoWorkerPool: WorkerPool,
   dirPath: string,
   targetDirPath: string,
   action: string,
@@ -75,28 +124,20 @@ async function processDirectory(
     const sourcePath = join(dirPath, entry.name);
     let relativePath = relative(sourceRoot, sourcePath);
     if (action === "decrypt") {
-      const cryptoWorker = new Worker(
-        new URL("./crypto_worker.ts", import.meta.url).href,
-        { type: "module" },
-      );
-      cryptoWorker.postMessage({
+      relativePath = await cryptoWorkerPool.addTask({
         type: "decryptPath",
-        data: relativePath,
+        data: new TextEncoder().encode(relativePath),
         cipher,
         password,
       });
-      relativePath = await new Promise((resolve) => {
-        cryptoWorker.onmessage = (e) => {
-          resolve(e.data);
-        };
-      });
-      cryptoWorker.terminate();
     }
     const targetPath = join(targetDirPath, relativePath);
 
     if (entry.isDirectory) {
       await ensureDir(targetPath);
       await processDirectory(
+        fileWorkerPool,
+        cryptoWorkerPool,
         sourcePath,
         targetDirPath,
         action,
@@ -105,7 +146,15 @@ async function processDirectory(
         password,
       );
     } else if (entry.isFile) {
-      await processFile(sourcePath, targetPath, action, cipher, password);
+      await processFile(
+        fileWorkerPool,
+        cryptoWorkerPool,
+        sourcePath,
+        targetPath,
+        action,
+        cipher,
+        password,
+      );
     }
   }
 }
@@ -136,38 +185,41 @@ async function main() {
     Deno.exit(1);
   }
 
+  const fileWorkerPool = new WorkerPool("./file_worker.ts", 4);
+  const cryptoWorkerPool = new WorkerPool("./crypto_worker.ts", 4);
+
   const sourceInfo = await Deno.stat(sourcePath);
 
   if (sourceInfo.isFile) {
     let finalTargetPath = targetFilePath;
     if (!targetFilePath) {
       const relativePath = relative(sourceRoot, sourcePath);
-      const cryptoWorker = new Worker(
-        new URL("./crypto_worker.ts", import.meta.url).href,
-        { type: "module" },
-      );
-      cryptoWorker.postMessage({
+      const decryptedFileName = await cryptoWorkerPool.addTask({
         type: "decryptPath",
-        data: relativePath,
+        data: new TextEncoder().encode(relativePath),
         cipher: "base64",
         password,
       });
-      const decryptedFileName = await new Promise((resolve) => {
-        cryptoWorker.onmessage = (e) => {
-          resolve(e.data);
-        };
-      });
-      cryptoWorker.terminate();
       finalTargetPath = join(saveDir, decryptedFileName);
     }
 
-    await processFile(sourcePath, finalTargetPath, action, "base64", password);
+    await processFile(
+      fileWorkerPool,
+      cryptoWorkerPool,
+      sourcePath,
+      finalTargetPath,
+      action,
+      "base64",
+      password,
+    );
   } else if (sourceInfo.isDirectory) {
     if (!targetFilePath && saveDir) {
       await ensureDir(saveDir);
     }
 
     await processDirectory(
+      fileWorkerPool,
+      cryptoWorkerPool,
       sourcePath,
       saveDir,
       action,
@@ -181,6 +233,9 @@ async function main() {
     );
     Deno.exit(1);
   }
+
+  fileWorkerPool.terminate();
+  cryptoWorkerPool.terminate();
 }
 
 await main();

@@ -1,7 +1,7 @@
 import { Cipher } from "./cipher.ts";
 
 self.onmessage = async (e) => {
-  const { type, data, cipher, password } = e.data;
+  const { id, type, data, cipher, password } = e.data;
   const cipherInstance = new Cipher(cipher);
   await cipherInstance.key(password, "");
 
@@ -10,9 +10,11 @@ self.onmessage = async (e) => {
       await cipherInstance[type === "encrypt" ? "encryptData" : "decryptData"](
         data,
       );
-    self.postMessage(result);
+    self.postMessage({ id, result });
   } else if (type === "decryptPath") {
-    const result = await cipherInstance.decryptFileName(data);
-    self.postMessage(result);
+    const result = await cipherInstance.decryptFileName(
+      new TextDecoder().decode(data),
+    );
+    self.postMessage({ id, result });
   }
 };
