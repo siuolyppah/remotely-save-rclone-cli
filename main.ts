@@ -1,23 +1,48 @@
 import { Cipher } from "./cipher.ts";
+import { parse } from "https://deno.land/std@0.95.0/flags/mod.ts";
+import {
+  readFileStr,
+  writeFileStr,
+} from "https://deno.land/std@0.95.0/fs/mod.ts";
+import { exists } from "https://deno.land/std@0.95.0/fs/exists.ts";
 import { deepStrictEqual } from "node:assert/strict";
 
-(async function () {
-  const password = "custom-password";
-  const salt = "custom-salt";
+async function main() {
+  const args = parse(Deno.args);
+  const sourceFilePath = args.source || args.s;
+  const targetFilePath = args.target || args.t;
+  const password = args.password || args.p;
+  const action = args.action || args.a;
+
+  if (!sourceFilePath || !targetFilePath || !password || !action) {
+    console.error(
+      "Missing required arguments: --source, --target, --password, --action",
+    );
+    Deno.exit(1);
+  }
+
+  if (!(await exists(sourceFilePath))) {
+    console.error(`Source file ${sourceFilePath} does not exist.`);
+    Deno.exit(1);
+  }
+
   const cipher = new Cipher("base64");
-  await cipher.key(password, salt);
+  await cipher.key(password, "");
 
-  const fileName = "custom-dir/custom-filename";
-  const encFileName = await cipher.encryptFileName(fileName);
-  console.log("Encrypted File Name:", encFileName);
-  const recoveredFileName = await cipher.decryptFileName(encFileName);
-  console.log("Recovered File Name:", recoveredFileName);
-  deepStrictEqual(fileName, recoveredFileName);
+  const fileContent = new Uint8Array(await Deno.readFile(sourceFilePath));
+  let result: Uint8Array;
 
-  const fileContent = new Uint8Array([1, 2, 3, 4, 5]); // user provided
-  const encFileContent = await cipher.encryptData(fileContent);
-  console.log("Encrypted File Content:", encFileContent);
-  const recoveredFileContent = await cipher.decryptData(encFileContent);
-  console.log("Recovered File Content:", recoveredFileContent);
-  deepStrictEqual(fileContent, recoveredFileContent);
-})();
+  if (action === "encrypt") {
+    result = await cipher.encryptData(fileContent);
+  } else if (action === "decrypt") {
+    result = await cipher.decryptData(fileContent);
+  } else {
+    console.error("Invalid action specified. Use 'encrypt' or 'decrypt'.");
+    Deno.exit(1);
+  }
+
+  await Deno.writeFile(targetFilePath, result);
+  console.log(`File ${action}ed successfully. Saved to ${targetFilePath}`);
+}
+
+await main();

@@ -2,8 +2,12 @@
 
 cli tool for decrypt file encrypted by [remotely-save](https://github.com/remotely-save/remotely-save).
 
-## Run
+## Usage
 
 ```bash
-deno run main.ts
+deno run --allow-read --allow-write --unstable main.ts \
+    --source=<source_file_path> \
+    --target=<target_file_path> \
+    --password=<password> \
+    --action=<encrypt_or_decrypt>
 ```
