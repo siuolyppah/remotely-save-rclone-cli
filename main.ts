@@ -1,4 +1,3 @@
-import { Cipher } from "./cipher.ts";
 import { parse } from "https://deno.land/std@0.95.0/flags/mod.ts";
 import { exists, ensureDir } from "https://deno.land/std@0.95.0/fs/mod.ts";
 import {
@@ -8,53 +7,105 @@ import {
 } from "https://deno.land/std@0.95.0/path/mod.ts";
 
 async function processFile(
-  cipher: Cipher,
   filePath: string,
   targetFilePath: string,
   action: string,
+  cipher: string,
+  password: string,
 ) {
-  const fileContent = new Uint8Array(await Deno.readFile(filePath));
-  let result: Uint8Array;
+  const fileWorker = new Worker(
+    new URL("./file_worker.ts", import.meta.url).href,
+    { type: "module" },
+  );
+  const cryptoWorker = new Worker(
+    new URL("./crypto_worker.ts", import.meta.url).href,
+    { type: "module" },
+  );
 
-  if (action === "encrypt") {
-    result = await cipher.encryptData(fileContent);
-  } else if (action === "decrypt") {
-    result = await cipher.decryptData(fileContent);
-  } else {
-    throw new Error("Invalid action specified. Use 'encrypt' or 'decrypt'.");
-  }
+  fileWorker.postMessage({ type: "read", filePath });
+
+  const fileContent: Uint8Array = await new Promise((resolve) => {
+    fileWorker.onmessage = (e) => {
+      resolve(e.data);
+    };
+  });
+
+  cryptoWorker.postMessage({
+    type: action,
+    data: fileContent,
+    cipher,
+    password,
+  });
+
+  const result: Uint8Array = await new Promise((resolve) => {
+    cryptoWorker.onmessage = (e) => {
+      resolve(e.data);
+    };
+  });
 
   await ensureDir(dirname(targetFilePath));
-  await Deno.writeFile(targetFilePath, result);
+
+  fileWorker.postMessage({
+    type: "write",
+    filePath: targetFilePath,
+    data: result,
+  });
+
+  await new Promise((resolve) => {
+    fileWorker.onmessage = (e) => {
+      resolve(e.data);
+    };
+  });
+
+  fileWorker.terminate();
+  cryptoWorker.terminate();
+
   console.log(`File ${action}ed successfully. Saved to ${targetFilePath}`);
 }
 
 async function processDirectory(
-  cipher: Cipher,
   dirPath: string,
   targetDirPath: string,
   action: string,
   sourceRoot: string,
+  cipher: string,
+  password: string,
 ) {
   for await (const entry of Deno.readDir(dirPath)) {
     const sourcePath = join(dirPath, entry.name);
     let relativePath = relative(sourceRoot, sourcePath);
     if (action === "decrypt") {
-      relativePath = await cipher.decryptFileName(relativePath);
+      const cryptoWorker = new Worker(
+        new URL("./crypto_worker.ts", import.meta.url).href,
+        { type: "module" },
+      );
+      cryptoWorker.postMessage({
+        type: "decryptPath",
+        data: relativePath,
+        cipher,
+        password,
+      });
+      relativePath = await new Promise((resolve) => {
+        cryptoWorker.onmessage = (e) => {
+          resolve(e.data);
+        };
+      });
+      cryptoWorker.terminate();
     }
     const targetPath = join(targetDirPath, relativePath);
 
     if (entry.isDirectory) {
       await ensureDir(targetPath);
       await processDirectory(
-        cipher,
         sourcePath,
         targetDirPath,
         action,
         sourceRoot,
+        cipher,
+        password,
       );
     } else if (entry.isFile) {
-      await processFile(cipher, sourcePath, targetPath, action);
+      await processFile(sourcePath, targetPath, action, cipher, password);
     }
   }
 }
@@ -85,26 +136,45 @@ async function main() {
     Deno.exit(1);
   }
 
-  const cipher = new Cipher("base64");
-  await cipher.key(password, "");
-
   const sourceInfo = await Deno.stat(sourcePath);
 
   if (sourceInfo.isFile) {
     let finalTargetPath = targetFilePath;
     if (!targetFilePath) {
       const relativePath = relative(sourceRoot, sourcePath);
-      const decryptedFileName = await cipher.decryptFileName(relativePath);
+      const cryptoWorker = new Worker(
+        new URL("./crypto_worker.ts", import.meta.url).href,
+        { type: "module" },
+      );
+      cryptoWorker.postMessage({
+        type: "decryptPath",
+        data: relativePath,
+        cipher: "base64",
+        password,
+      });
+      const decryptedFileName = await new Promise((resolve) => {
+        cryptoWorker.onmessage = (e) => {
+          resolve(e.data);
+        };
+      });
+      cryptoWorker.terminate();
       finalTargetPath = join(saveDir, decryptedFileName);
     }
 
-    await processFile(cipher, sourcePath, finalTargetPath, action);
+    await processFile(sourcePath, finalTargetPath, action, "base64", password);
   } else if (sourceInfo.isDirectory) {
     if (!targetFilePath && saveDir) {
       await ensureDir(saveDir);
     }
 
-    await processDirectory(cipher, sourcePath, saveDir, action, sourceRoot);
+    await processDirectory(
+      sourcePath,
+      saveDir,
+      action,
+      sourceRoot,
+      "base64",
+      password,
+    );
   } else {
     console.error(
       "Invalid source path specified. It must be a file or directory.",
