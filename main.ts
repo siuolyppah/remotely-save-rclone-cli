@@ -1,18 +1,74 @@
 import { Cipher } from "./cipher.ts";
 import { parse } from "https://deno.land/std@0.95.0/flags/mod.ts";
 import { exists, ensureDir } from "https://deno.land/std@0.95.0/fs/mod.ts";
-import { join, relative } from "https://deno.land/std@0.95.0/path/mod.ts";
+import {
+  join,
+  relative,
+  dirname,
+} from "https://deno.land/std@0.95.0/path/mod.ts";
+
+async function processFile(
+  cipher: Cipher,
+  filePath: string,
+  targetFilePath: string,
+  action: string,
+) {
+  const fileContent = new Uint8Array(await Deno.readFile(filePath));
+  let result: Uint8Array;
+
+  if (action === "encrypt") {
+    result = await cipher.encryptData(fileContent);
+  } else if (action === "decrypt") {
+    result = await cipher.decryptData(fileContent);
+  } else {
+    throw new Error("Invalid action specified. Use 'encrypt' or 'decrypt'.");
+  }
+
+  await ensureDir(dirname(targetFilePath));
+  await Deno.writeFile(targetFilePath, result);
+  console.log(`File ${action}ed successfully. Saved to ${targetFilePath}`);
+}
+
+async function processDirectory(
+  cipher: Cipher,
+  dirPath: string,
+  targetDirPath: string,
+  action: string,
+  sourceRoot: string,
+) {
+  for await (const entry of Deno.readDir(dirPath)) {
+    const sourcePath = join(dirPath, entry.name);
+    let relativePath = relative(sourceRoot, sourcePath);
+    if (action === "decrypt") {
+      relativePath = await cipher.decryptFileName(relativePath);
+    }
+    const targetPath = join(targetDirPath, relativePath);
+
+    if (entry.isDirectory) {
+      await ensureDir(targetPath);
+      await processDirectory(
+        cipher,
+        sourcePath,
+        targetDirPath,
+        action,
+        sourceRoot,
+      );
+    } else if (entry.isFile) {
+      await processFile(cipher, sourcePath, targetPath, action);
+    }
+  }
+}
 
 async function main() {
   const args = parse(Deno.args);
-  const sourceFilePath = args.source || args.s;
+  const sourcePath = args.source || args.s;
   const targetFilePath = args.target || args.t;
   const password = args.password || args.p;
   const action = args.action || args.a;
   const saveDir = args.save_dir || args.d;
   const sourceRoot = args.source_root || args.r;
 
-  if (!sourceFilePath || !password || !action) {
+  if (!sourcePath || !password || !action) {
     console.error("Missing required arguments: --source, --password, --action");
     Deno.exit(1);
   }
@@ -24,45 +80,37 @@ async function main() {
     Deno.exit(1);
   }
 
-  if (!(await exists(sourceFilePath))) {
-    console.error(`Source file ${sourceFilePath} does not exist.`);
+  if (!(await exists(sourcePath))) {
+    console.error(`Source path ${sourcePath} does not exist.`);
     Deno.exit(1);
   }
 
   const cipher = new Cipher("base64");
   await cipher.key(password, "");
 
-  const fileContent = new Uint8Array(await Deno.readFile(sourceFilePath));
-  let result: Uint8Array;
-  let finalTargetPath: string;
+  const sourceInfo = await Deno.stat(sourcePath);
 
-  if (action === "encrypt") {
-    result = await cipher.encryptData(fileContent);
-    finalTargetPath = targetFilePath || sourceFilePath;
-  } else if (action === "decrypt") {
-    result = await cipher.decryptData(fileContent);
-    if (targetFilePath) {
-      finalTargetPath = targetFilePath;
-    } else {
-      const relativePath = relative(sourceRoot, sourceFilePath);
+  if (sourceInfo.isFile) {
+    let finalTargetPath = targetFilePath;
+    if (!targetFilePath) {
+      const relativePath = relative(sourceRoot, sourcePath);
       const decryptedFileName = await cipher.decryptFileName(relativePath);
       finalTargetPath = join(saveDir, decryptedFileName);
     }
+
+    await processFile(cipher, sourcePath, finalTargetPath, action);
+  } else if (sourceInfo.isDirectory) {
+    if (!targetFilePath && saveDir) {
+      await ensureDir(saveDir);
+    }
+
+    await processDirectory(cipher, sourcePath, saveDir, action, sourceRoot);
   } else {
-    console.error("Invalid action specified. Use 'encrypt' or 'decrypt'.");
+    console.error(
+      "Invalid source path specified. It must be a file or directory.",
+    );
     Deno.exit(1);
   }
-
-  // Ensure the save directory exists
-  if (!targetFilePath && saveDir) {
-    await ensureDir(saveDir);
-  }
-
-  // Ensure the directory for the final target path exists
-  await ensureDir(join(finalTargetPath, ".."));
-
-  await Deno.writeFile(finalTargetPath, result);
-  console.log(`File ${action}ed successfully. Saved to ${finalTargetPath}`);
 }
 
 await main();
