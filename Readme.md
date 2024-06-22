@@ -7,7 +7,9 @@ cli tool for decrypt file encrypted by [remotely-save](https://github.com/remote
 ```bash
 deno run --allow-read --allow-write --unstable main.ts \
     --source=<source_file_path> \
-    --target=<target_file_path> \
     --password=<password> \
-    --action=<encrypt_or_decrypt>
+    --action=<encrypt_or_decrypt> \
+    [--target=<target_file_path>] \
+    [--save_dir=<save_directory>] \
+    [--source_root=<source_root_directory>]
 ```
